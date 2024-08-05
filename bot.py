@@ -12,9 +12,8 @@ import json
 import secrets
 from openpyxl import load_workbook
 
-
 # Настройки логирования
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Глобальные переменные
@@ -73,6 +72,7 @@ CHAT_IDS = load_chat_ids()
 FILE_INFO = load_file_info()
 FILE_PATH = FILE_INFO['FILE_PATH']
 SHEET_NAME = FILE_INFO['SHEET_NAME']
+IDS_TG_FOR_DUTY = {"Ступников":  "@CarpetKnight", "Новоселов": "@knstntnovoslv", "Литвинчук": "@Li_Aleks", "Образцов": "@vanblacksun", "Шипунов": "@avshipunov"}
 
 
 def check_and_add_chat_id(chat_id, chat_type):
@@ -210,7 +210,8 @@ async def start(update: Update, context: CallbackContext) -> None:
 /duties_month
 /findnext
 Пример: /findnext Иванов
-/getid''')
+/getid
+/currentduty''')
 
 
 async def update_file(update: Update, context: CallbackContext) -> None:
@@ -280,16 +281,142 @@ async def add_user(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f'Пользователь с ID {new_user_id} уже в списке авторизованных.')
 
 
+def parse_time_range(time_range):
+    try:
+        start_time_str, end_time_str = time_range.split(' - ')
+        start_time = datetime.strptime(start_time_str.strip(), '%H:%M').time()
+        end_time = datetime.strptime(end_time_str.strip(), '%H:%M').time()
+        return start_time, end_time
+    except Exception as e:
+        logger.error(f"Ошибка при разборе временного диапазона: {e}")
+        return None, None
+
+def is_current_time_in_range(start_time, end_time, current_time):
+    if start_time <= end_time:
+        return start_time <= current_time <= end_time
+    else:  # Over midnight case
+        return current_time >= start_time or current_time <= end_time
+
+def get_duty_for_current_date(df, target_date):
+    today = datetime.now(pytz.timezone(TIMEZONE))
+    current_time = today.time()
+    target_date_str = target_date.strftime('%d %b %a')  # Обновленный формат даты
+    logger.debug(f"Целевая дата: {target_date_str}")
+
+    df['Дата'] = pd.to_datetime(df['Дата'], format='%d %b %a', errors='coerce').dt.strftime('%d %b %a')
+    target_df = df[df['Дата'] == target_date_str]
+
+    logger.debug(f"Отфильтрованный DataFrame для {target_date_str}:")
+    logger.debug(f"{target_df}")
+
+    if target_df.empty:
+        logger.info(f"Нет данных о дежурных на {target_date_str}.")
+        return f"Нет данных о дежурных на {target_date_str}."
+
+    time_range_column = target_df.columns[1]
+    target_df = target_df.dropna(subset=[time_range_column])
+
+    filtered_df = pd.DataFrame()
+    for _, row in target_df.iterrows():
+        duty_time_range = row[time_range_column]
+
+        if isinstance(duty_time_range, float):
+            duty_time_range = str(duty_time_range).strip()
+
+        if pd.isna(duty_time_range) or ' - ' not in duty_time_range:
+            logger.debug("Пропущен пустой или неправильный временной диапазон.")
+            continue
+
+        start_time, end_time = parse_time_range(duty_time_range)
+        logger.debug(f"Время начала: {start_time}, Время окончания: {end_time}")
+
+        if start_time is None or end_time is None:
+            logger.debug("Пропущен неправильный временной диапазон.")
+            continue
+
+        if is_current_time_in_range(start_time, end_time, current_time):
+            filtered_df = filtered_df.append(row)
+            break  # Предполагаем, что нам нужна только одна строка
+
+    if filtered_df.empty:
+        logger.info(f"Нет данных о дежурных на {target_date_str} в текущее время.")
+        return f"Нет данных о дежурных на {target_date_str} в текущее время."
+
+    messages = []
+    for _, row in filtered_df.iterrows():
+        date_str = row['Дата']
+        duty_time_range = row[time_range_column]
+        logger.debug(f"Обработка строки: {row}")
+
+        for column_name in row.index[3:]:  # Начинаем с 4-го столбца (индекс 3)
+            if row[column_name] == 1:
+                duty_person = column_name.split(' ')[0]
+                duty_info = f"C {duty_time_range} дежурит {duty_person}"
+
+                # Проверяем наличие ID в словаре
+                if duty_person in IDS_TG_FOR_DUTY:
+                    tg_id = IDS_TG_FOR_DUTY[duty_person]
+                    if tg_id is not None:
+                        duty_info += ' ' + tg_id
+
+                logger.debug(f"Добавлено сообщение: {duty_info}")
+                messages.append(duty_info)
+
+    result_message = "\n".join(messages) if messages else f"Нет дежурных в текущее время."
+    logger.debug(f"Результат сообщения: {result_message}")
+    return result_message
+
+async def send_duties_with_time_filter(update: Update = None, context: CallbackContext = None) -> None:
+    logger.info("Отправка дежурств с фильтрацией по текущему времени началась")
+    try:
+        df = load_excel(FILE_PATH, SHEET_NAME)
+        today = datetime.now(pytz.timezone(TIMEZONE))
+        current_time = today.time()
+        logger.debug(f"Сегодняшняя дата и текущее время: {today}, {current_time}")
+
+        message = get_duty_for_current_date(df, today)
+
+        logger.debug(f"Сформированное сообщение: {message}")
+
+        if context and context.chat_data:
+            chat_id = context.chat_data.get('chat_id')
+            if chat_id:
+                await bot.send_message(chat_id=chat_id, text=message)
+                logger.info(f"Сообщение отправлено в чат {chat_id}")
+        else:
+            for chat_id in CHAT_IDS:
+                await bot.send_message(chat_id=chat_id, text=message)
+                logger.info(f"Сообщение отправлено в чат {chat_id}")
+
+        logger.info("Сообщение отправлено")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения: {e}")
+async def get_user_id(update: Update, context: CallbackContext) -> None:
+    user_id = update.effective_user.id
+    await update.message.reply_text(f'Ваш ID: {user_id}')
+
 def schedule_send_duties(scheduler: BackgroundScheduler):
+
+    # Ежедневная рассылка дежурных
+    scheduler.add_job(
+        lambda: asyncio.run_coroutine_threadsafe(send_duties_with_time_filter(), loop),
+        CronTrigger(hour=00, minute=00, timezone=TIMEZONE),
+    )
+
+    scheduler.add_job(
+        lambda: asyncio.run_coroutine_threadsafe(send_duties_with_time_filter(), loop),
+        CronTrigger(hour=12, minute=00, timezone=TIMEZONE),
+    )
+
+    scheduler.add_job(
+        lambda: asyncio.run_coroutine_threadsafe(send_duties_with_time_filter(), loop),
+        CronTrigger(hour=19, minute=00, timezone=TIMEZONE),
+    )
+
     scheduler.add_job(
         lambda: asyncio.run_coroutine_threadsafe(send_duties(), loop),
         CronTrigger(hour=7, minute=0, timezone=TIMEZONE),
     )
-
-
-async def get_user_id(update: Update, context: CallbackContext) -> None:
-    user_id = update.effective_user.id
-    await update.message.reply_text(f'Ваш ID: {user_id}')
 
 
 def main():
@@ -302,6 +429,7 @@ def main():
     application.add_handler(CommandHandler("duties_month", duties_month))
     application.add_handler(CommandHandler("findnext", findnext))
     application.add_handler(CommandHandler("adduser", add_user))
+    application.add_handler(CommandHandler("currentduty", send_duties_with_time_filter))
     application.add_handler(CommandHandler("getid", get_user_id))
     application.add_handler(MessageHandler(filters.Document.FileExtension("xlsx"), handle_document))
 
